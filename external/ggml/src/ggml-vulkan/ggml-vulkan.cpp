@@ -269,7 +269,11 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+static constexpr uint32_t mul_mat_vec_max_cols = 64;
+// Runtime limits for the mat-vec paths (GGML_VK_MMV_MAX_COLS, GGML_VK_MMVID_MAX_TOKENS). On Intel Battlemage with
+// Mesa the tiled matrix shaders have a large fixed cost per k step, so wider mat-vec dispatches win up to ~32 columns.
+static uint32_t vk_mmv_max_cols = 8;
+static uint32_t vk_mmvid_max_tokens = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -1824,7 +1828,7 @@ class vk_perf_logger {
             const uint64_t k     = node->src[1]->ne[0];
             const uint64_t batch = node->ne[2] * node->ne[3];
             std::string    name  = ggml_op_name(node->op);
-            if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+            if ((node->op == GGML_OP_MUL_MAT && n <= vk_mmv_max_cols) ||
                 (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
                 name += "_VEC";
             }
@@ -6104,6 +6108,12 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    if (const char * v = getenv("GGML_VK_MMV_MAX_COLS")) {
+        vk_mmv_max_cols = std::max<uint32_t>(1, std::min<uint32_t>(mul_mat_vec_max_cols, (uint32_t) std::stoul(v)));
+    }
+    if (const char * v = getenv("GGML_VK_MMVID_MAX_TOKENS")) {
+        vk_mmvid_max_tokens = (uint32_t) std::stoul(v);
+    }
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -7370,7 +7380,9 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     }
 
     uint32_t split_k = 1;
-    if (ctx->device->shader_core_count != 0 && m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]) {
+    // GGML_VK_SPLIT_K_SMALL_N: also split when n is smaller than one tile (single-token-per-row batched decode).
+    static const bool split_small_n = getenv("GGML_VK_SPLIT_K_SMALL_N") != nullptr;
+    if (ctx->device->shader_core_count != 0 && (split_small_n || (m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1]))) {
         // If k is 'large' and the SMs will fill less than halfway, use split_k.
         uint32_t m_tiles = CEIL_DIV(m, pipeline->wg_denoms[0]);
         uint32_t n_tiles = CEIL_DIV(n, pipeline->wg_denoms[1]);
@@ -8600,7 +8612,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= vk_mmv_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -9138,7 +9150,7 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src2 = dst->src[2];
-    return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    return (src2->ne[1] <= vk_mmvid_max_tokens) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16713,6 +16725,10 @@ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev)
     case 0xE20B:  // B580
     case 0xE211:  // Pro B60
         return 20;
+    case 0xE223:  // Pro B70 (BMG-G31)
+    case 0xE221:
+    case 0xE222:
+        return 32;
     default:
         return 0;
     }

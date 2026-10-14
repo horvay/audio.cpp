@@ -1440,6 +1440,7 @@ audiocpp_add_model(fish_drama3
     SOURCES
         src/community_models/fish_drama3/assets.cpp
         src/community_models/fish_drama3/backbone.cpp
+        src/community_models/fish_drama3/batch_engine.cpp
         src/community_models/fish_drama3/generator.cpp
         src/community_models/fish_drama3/loader.cpp
         src/community_models/fish_drama3/prompt.cpp
@@ -2718,6 +2719,12 @@ add_executable(audiocpp_cli
 )
 
 target_link_libraries(audiocpp_cli PRIVATE engine_runtime ggml)
+
+add_executable(drama3_batch app/drama3_batch/main.cpp)
+target_link_libraries(drama3_batch PRIVATE engine_runtime ggml)
+if (ENGINE_ENABLE_OPENMP)
+    target_link_libraries(drama3_batch PRIVATE OpenMP::OpenMP_CXX)
+endif()
 audiocpp_use_utf8_codepage(audiocpp_cli)
 if(AUDIOCPP_STATIC_ESPEAK)
     audiocpp_stage_espeak(audiocpp_cli)
@@ -4620,3 +4627,6 @@ if (ENGINE_BUILD_EXAMPLES)
         target_link_libraries(model_spec_download_demo PRIVATE OpenMP::OpenMP_CXX)
     endif()
 endif()
+
+add_executable(drama3_mm_bench app/drama3_batch/mm_bench.cpp)
+target_link_libraries(drama3_mm_bench PRIVATE ggml)
