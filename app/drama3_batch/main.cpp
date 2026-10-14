@@ -152,6 +152,7 @@ int main(int argc, char ** argv) {
     int64_t codec_bench = 0;
     std::string save_codes_dir;
     int decode_workers = 6;
+    bool codec_threads_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) usage(); return argv[++i]; };
@@ -175,7 +176,7 @@ int main(int argc, char ** argv) {
         else if (a == "--codec-bench") codec_bench = std::stoll(next());
         else if (a == "--save-codes") save_codes_dir = next();
         else if (a == "--decode-workers") decode_workers = std::stoi(next());
-        else if (a == "--codec-threads") opt.codec_cpu_threads = std::stoi(next());
+        else if (a == "--codec-threads") { opt.codec_cpu_threads = std::stoi(next()); codec_threads_set = true; }
         else if (a == "-h" || a == "--help") usage();
         else if (!a.empty() && a[0] == '-') { std::cerr << "unknown option " << a << "\n"; usage(); }
         else jobs_path = a;
@@ -282,7 +283,15 @@ int main(int argc, char ** argv) {
     setenv("FISH_DAC_DECODE_BUCKET", "32", 0);  // decode graphs per 32-frame bucket (see fish_dac_codec_runtime.cpp)
     setenv("FISH_DAC_DECODE_GRAPHS", "3", 0);
     if (codec_mode == "cpu") opt.codec_cpu_workers = decode_workers;
-    else if (codec_mode != "gpu") usage();
+    else if (codec_mode == "gpu") {  // one CPU codec for very long takes (decode_any); it blocks generation, so give it
+        opt.codec_cpu_workers = 1;      // more threads than a CPU-mode worker gets
+        if (!codec_threads_set) opt.codec_cpu_threads = 16;
+    }
+    else usage();
+    // A long take (a runaway near the frame limit) needs a multi-GB codec graph on top of the ~29 GiB the engine holds
+    // at batch 16 (1,000 frames asked for 4.96 GB and failed): decode takes over D3_CPU_DECODE_FRAMES frames (default
+    // 512, about 24 s) on the CPU, and fall back to the CPU when a GPU decode fails.
+    const int64_t cpu_decode_frames = getenv("D3_CPU_DECODE_FRAMES") ? std::atoll(getenv("D3_CPU_DECODE_FRAMES")) : 512;
     const auto t_load = Clock::now();
     auto assets = load_drama3_assets(model);
     engine::core::BackendConfig backend;
@@ -364,6 +373,17 @@ int main(int argc, char ** argv) {
                          static_cast<long long>(done_count), jobs.size(), audio_s, el, rate, eta / 60.0, pending.size());
         }
     };
+    auto decode_any = [&](int w, const Drama3BatchResult & r) {
+        if (codec_mode == "cpu") return engine.decode_cpu(w, r.codes);
+        if (r.codes.frames > cpu_decode_frames) return engine.decode_cpu(0, r.codes);
+        try {
+            return engine.decode(r.codes);
+        } catch (const std::exception & e) {
+            std::cerr << "[drama3_batch] " << r.id << ": GPU decode of " << r.codes.frames << " frames failed ("
+                      << e.what() << "), decoding on the CPU\n";
+            return engine.decode_cpu(0, r.codes);
+        }
+    };
     std::vector<std::thread> workers;
     // GPU codec: one worker thread with the codec's own Vulkan backend, overlapping generation. CPU codec: N workers.
     const bool threaded_gpu = codec_mode == "gpu" && getenv("D3_ASYNC_DECODE") != nullptr;
@@ -381,7 +401,7 @@ int main(int argc, char ** argv) {
                         pending.pop_front();
                     }
                     const auto t_dec = Clock::now();
-                    auto audio = codec_mode == "cpu" ? engine.decode_cpu(w, r.codes) : engine.decode(r.codes);
+                    auto audio = decode_any(w, r);
                     write_one(r, std::move(audio), std::chrono::duration<double>(Clock::now() - t_dec).count());
                 }
             });
@@ -416,7 +436,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const auto t_dec = Clock::now();
-        auto audio = engine.decode(r.codes);
+        auto audio = decode_any(0, r);
         write_one(r, std::move(audio), std::chrono::duration<double>(Clock::now() - t_dec).count());
     };
     engine.run(jobs, on_done);

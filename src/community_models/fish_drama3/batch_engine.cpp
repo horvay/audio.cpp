@@ -1229,7 +1229,18 @@ private:
         auto it = graphs_.find(keys);
         if (it == graphs_.end()) it = graphs_.emplace(keys, build(1, opt_.batch, 0, keys, true)).first;
         if (current_ != it->second.get()) {
+            const size_t before = ggml_gallocr_get_buffer_size(galloc_, 0);
             if (!ggml_gallocr_alloc_graph(galloc_, it->second->graph)) throw std::runtime_error("Drama 3 decode allocation failed");
+            if (ggml_gallocr_get_buffer_size(galloc_, 0) != before) {
+                // The compute buffer was reallocated. gallocr never moves a tensor that already has data, so every
+                // other cached graph still points into the freed buffer: drop them, they are rebuilt on next use.
+                const size_t had = graphs_.size();
+                for (auto g = graphs_.begin(); g != graphs_.end();)
+                    g = g->second.get() == it->second.get() ? std::next(g) : graphs_.erase(g);
+                if (opt_.verbose) std::cerr << "[drama3_batch] compute buffer " << before << " -> "
+                                            << ggml_gallocr_get_buffer_size(galloc_, 0) << " bytes at " << keys
+                                            << " keys, dropped " << had - graphs_.size() << " cached graphs\n";
+            }
             current_ = it->second.get();
         }
         return *it->second;
