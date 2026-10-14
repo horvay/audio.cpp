@@ -1,0 +1,130 @@
+#version 450
+
+// Small-n matrix multiply for batched decode: D[c][m] = sum_k A[m][k] * B[c][k], for 1 < n <= NCOLS columns.
+// The mat-vec shaders re-read B for every weight row and the tiled shaders have a large fixed cost per k step on
+// some GPUs (Intel Battlemage with Mesa), so this reads each weight block once and keeps B in shared memory.
+//
+// Workgroup: 256 threads, BM = 64 rows. Thread t: ks = t % 4 (32-wide k slice of a 128-wide chunk),
+// cg = (t / 4) % 4 (column group of NCOLS / 4 columns), rg = t / 16 (4 consecutive rows). The four k slices of a
+// (row, column) pair sit in neighbouring lanes and are summed with a clustered subgroup add.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint NCOLS = 32;
+
+#if defined(DATA_A_Q8_0)
+struct block_q8_0_smalln {
+    float16_t d;
+    int8_t qs[32];
+};
+layout(binding = 0) readonly buffer A { block_q8_0_smalln data_a[]; };
+#else
+layout(binding = 0) readonly buffer A { float16_t data_a[]; };
+#endif
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;   // A elements (blocks for Q8_0) per row
+    uint stride_b;   // floats per B column
+    uint stride_d;   // floats per D column
+    uint a_offset;   // in A elements
+    uint b_offset;   // in floats
+    uint d_offset;   // in floats
+    uint mode;       // diagnostics: bit 0 skips weight loads, bit 1 skips shared B reads
+} p;
+
+#define BM 64
+#define BK 128
+#define KS 4
+#define KW 32
+#define RPT 4
+#define CPT (NCOLS / 4)
+// Shared B layout [column][k slice][KW + 1], with one extra float per column, to keep lanes on distinct banks.
+#define SLICE_STRIDE (KW + 1)
+#define COL_STRIDE (KS * SLICE_STRIDE + 1)
+
+shared float Bs[NCOLS * COL_STRIDE];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const uint ks = t % 4;
+    const uint cg = (t / 4) % 4;
+    const uint rg = t / 16;
+    const uint row0 = gl_WorkGroupID.x * BM + rg * RPT;
+
+    float acc[RPT][CPT];
+    [[unroll]] for (uint r = 0; r < RPT; ++r) {
+        [[unroll]] for (uint c = 0; c < CPT; ++c) {
+            acc[r][c] = 0.0;
+        }
+    }
+
+    uint rows[RPT];
+    [[unroll]] for (uint r = 0; r < RPT; ++r) {
+        rows[r] = min(row0 + r, p.M - 1);
+    }
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        barrier();
+        for (uint i = t; i < NCOLS * BK; i += 256) {
+            const uint c = i / BK;
+            const uint kk = i % BK;
+            Bs[c * COL_STRIDE + (kk / KW) * SLICE_STRIDE + (kk % KW)] =
+                c < p.N ? data_b[p.b_offset + c * p.stride_b + k0 + kk] : 0.0;
+        }
+        barrier();
+
+        const uint kbase = k0 + ks * KW;
+#if defined(DATA_A_Q8_0)
+        float scale[RPT];
+        uint blk[RPT];
+        [[unroll]] for (uint r = 0; r < RPT; ++r) {
+            blk[r] = p.a_offset + rows[r] * p.stride_a + kbase / 32;
+            scale[r] = float(data_a[blk[r]].d);
+        }
+#endif
+        [[unroll]] for (uint i = 0; i < KW; i += 4) {
+            vec4 w[RPT];
+            if ((p.mode & 1u) != 0) {
+                [[unroll]] for (uint r = 0; r < RPT; ++r) w[r] = vec4(float(r + i));
+            } else
+            [[unroll]] for (uint r = 0; r < RPT; ++r) {
+#if defined(DATA_A_Q8_0)
+                w[r] = scale[r] * vec4(float(data_a[blk[r]].qs[i]), float(data_a[blk[r]].qs[i + 1]),
+                                       float(data_a[blk[r]].qs[i + 2]), float(data_a[blk[r]].qs[i + 3]));
+#else
+                const uint a = p.a_offset + rows[r] * p.stride_a + kbase + i;
+                w[r] = vec4(float(data_a[a]), float(data_a[a + 1]), float(data_a[a + 2]), float(data_a[a + 3]));
+#endif
+            }
+            [[unroll]] for (uint c = 0; c < CPT; ++c) {
+                const uint s = (cg * CPT + c) * COL_STRIDE + ks * SLICE_STRIDE + i;
+                const vec4 b = (p.mode & 2u) != 0 ? vec4(float(c)) : vec4(Bs[s], Bs[s + 1], Bs[s + 2], Bs[s + 3]);
+                [[unroll]] for (uint r = 0; r < RPT; ++r) {
+                    acc[r][c] += dot(w[r], b);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < RPT; ++r) {
+        [[unroll]] for (uint c = 0; c < CPT; ++c) {
+            const float v = subgroupClusteredAdd(acc[r][c], 4);
+            const uint col = cg * CPT + c;
+            if (ks == 0 && row0 + r < p.M && col < p.N) {
+                data_d[p.d_offset + col * p.stride_d + row0 + r] = v;
+            }
+        }
+    }
+}

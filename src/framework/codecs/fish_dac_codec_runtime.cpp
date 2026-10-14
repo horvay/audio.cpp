@@ -22,6 +22,8 @@
 
 #include "engine/framework/core/constant_tensor_cache.h"
 
+#include <list>
+#include <cstdlib>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml.h>
@@ -754,9 +756,27 @@ CodecTransformerWeights load_transformer(
         const std::string layer_prefix = prefix + ".layers." + std::to_string(layer);
         CodecTransformerLayerWeights weights;
         weights.attention_norm = binding::norm_weight_from_source(store, source, layer_prefix + ".attention_norm", kCodecDim);
-        weights.attention.q_weight = store.load_tensor(source, layer_prefix + ".attention.q_proj.weight", storage_type, {kCodecDim, kCodecDim});
-        weights.attention.k_weight = store.load_tensor(source, layer_prefix + ".attention.k_proj.weight", storage_type, {kCodecDim, kCodecDim});
-        weights.attention.v_weight = store.load_tensor(source, layer_prefix + ".attention.v_proj.weight", storage_type, {kCodecDim, kCodecDim});
+        if (source.has_tensor(layer_prefix + ".attention.q_proj.weight")) {
+            weights.attention.q_weight = store.load_tensor(source, layer_prefix + ".attention.q_proj.weight", storage_type, {kCodecDim, kCodecDim});
+            weights.attention.k_weight = store.load_tensor(source, layer_prefix + ".attention.k_proj.weight", storage_type, {kCodecDim, kCodecDim});
+            weights.attention.v_weight = store.load_tensor(source, layer_prefix + ".attention.v_proj.weight", storage_type, {kCodecDim, kCodecDim});
+        } else {
+            // Official DAC checkpoints store [query, key, value] as one matrix.
+            // Preserve the package's storage when materializing the three rows.
+            const auto name = layer_prefix + ".attention.wqkv.weight";
+            const auto packed = source.require_f32(name, {3 * kCodecDim, kCodecDim});
+            const auto type = storage_type == assets::TensorStorageType::Native
+                ? assets::tensor_storage_type_for_dtype(source.require_metadata(name).dtype)
+                : storage_type;
+            const size_t count = static_cast<size_t>(kCodecDim * kCodecDim);
+            const auto part = [&](size_t offset) {
+                return store.make_from_f32(core::TensorShape::from_dims({kCodecDim, kCodecDim}), type,
+                    std::vector<float>(packed.begin() + offset * count, packed.begin() + (offset + 1) * count));
+            };
+            weights.attention.q_weight = part(0);
+            weights.attention.k_weight = part(1);
+            weights.attention.v_weight = part(2);
+        }
         weights.attention.out_weight = store.load_tensor(source, layer_prefix + ".attention.wo.weight", storage_type, {kCodecDim, kCodecDim});
         weights.attention_scale = binding::layer_scale_from_named_source(store, source, layer_prefix + ".attention_layer_scale.gamma");
         weights.ffn_norm = binding::norm_weight_from_source(store, source, layer_prefix + ".ffn_norm", kCodecDim);
@@ -1384,6 +1404,23 @@ public:
     }
 
     runtime::AudioBuffer decode_codes(const FishDacCodes & codes) {
+        // FISH_DAC_DECODE_BUCKET=N: keep up to FISH_DAC_DECODE_GRAPHS (default 4) graphs whose capacities are
+        // multiples of N frames, instead of one graph that every shorter request is padded up to.
+        static const int64_t bucket = std::getenv("FISH_DAC_DECODE_BUCKET") ? std::atoll(std::getenv("FISH_DAC_DECODE_BUCKET")) : 0;
+        static const size_t max_graphs = std::getenv("FISH_DAC_DECODE_GRAPHS") ? std::atoll(std::getenv("FISH_DAC_DECODE_GRAPHS")) : 4;
+        if (bucket > 0) {
+            const int64_t capacity = (codes.frames + bucket - 1) / bucket * bucket;
+            auto it = bucket_graphs_.begin();
+            for (; it != bucket_graphs_.end(); ++it) if (it->first == capacity) break;
+            if (it == bucket_graphs_.end()) {
+                while (bucket_graphs_.size() >= std::max<size_t>(1, max_graphs)) bucket_graphs_.pop_back();
+                bucket_graphs_.emplace_front(capacity, std::make_unique<DecodeGraph>(
+                    component_->impl_->config, component_->impl_->weights, execution_, graph_arena_bytes_, capacity));
+            } else if (it != bucket_graphs_.begin()) {
+                bucket_graphs_.splice(bucket_graphs_.begin(), bucket_graphs_, it);
+            }
+            return bucket_graphs_.front().second->run(codes);
+        }
         if (decode_graph_ == nullptr || !decode_graph_->matches(codes.frames, execution_.backend(), threads_)) {
             decode_graph_.reset();
             decode_graph_ = std::make_unique<DecodeGraph>(
@@ -1434,6 +1471,7 @@ public:
     }
 
     void release_decode_graphs() {
+        bucket_graphs_.clear();
         decode_graph_.reset();
         latent_decode_graph_.reset();
         stream_decode_graph_.reset();
@@ -1457,6 +1495,7 @@ private:
     size_t graph_arena_bytes_ = 0;
     std::unique_ptr<EncodeGraph> encode_graph_;
     std::unique_ptr<DecodeGraph> decode_graph_;
+    std::list<std::pair<int64_t, std::unique_ptr<DecodeGraph>>> bucket_graphs_;
     std::unique_ptr<DecodeGraph> stream_decode_graph_;
     std::unique_ptr<LatentDecodeGraph> latent_decode_graph_;
 };
