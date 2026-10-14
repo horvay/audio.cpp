@@ -22,6 +22,8 @@
 
 #include "engine/framework/core/constant_tensor_cache.h"
 
+#include <list>
+#include <cstdlib>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml.h>
@@ -1402,6 +1404,23 @@ public:
     }
 
     runtime::AudioBuffer decode_codes(const FishDacCodes & codes) {
+        // FISH_DAC_DECODE_BUCKET=N: keep up to FISH_DAC_DECODE_GRAPHS (default 4) graphs whose capacities are
+        // multiples of N frames, instead of one graph that every shorter request is padded up to.
+        static const int64_t bucket = std::getenv("FISH_DAC_DECODE_BUCKET") ? std::atoll(std::getenv("FISH_DAC_DECODE_BUCKET")) : 0;
+        static const size_t max_graphs = std::getenv("FISH_DAC_DECODE_GRAPHS") ? std::atoll(std::getenv("FISH_DAC_DECODE_GRAPHS")) : 4;
+        if (bucket > 0) {
+            const int64_t capacity = (codes.frames + bucket - 1) / bucket * bucket;
+            auto it = bucket_graphs_.begin();
+            for (; it != bucket_graphs_.end(); ++it) if (it->first == capacity) break;
+            if (it == bucket_graphs_.end()) {
+                while (bucket_graphs_.size() >= std::max<size_t>(1, max_graphs)) bucket_graphs_.pop_back();
+                bucket_graphs_.emplace_front(capacity, std::make_unique<DecodeGraph>(
+                    component_->impl_->config, component_->impl_->weights, execution_, graph_arena_bytes_, capacity));
+            } else if (it != bucket_graphs_.begin()) {
+                bucket_graphs_.splice(bucket_graphs_.begin(), bucket_graphs_, it);
+            }
+            return bucket_graphs_.front().second->run(codes);
+        }
         if (decode_graph_ == nullptr || !decode_graph_->matches(codes.frames, execution_.backend(), threads_)) {
             decode_graph_.reset();
             decode_graph_ = std::make_unique<DecodeGraph>(
@@ -1452,6 +1471,7 @@ public:
     }
 
     void release_decode_graphs() {
+        bucket_graphs_.clear();
         decode_graph_.reset();
         latent_decode_graph_.reset();
         stream_decode_graph_.reset();
@@ -1475,6 +1495,7 @@ private:
     size_t graph_arena_bytes_ = 0;
     std::unique_ptr<EncodeGraph> encode_graph_;
     std::unique_ptr<DecodeGraph> decode_graph_;
+    std::list<std::pair<int64_t, std::unique_ptr<DecodeGraph>>> bucket_graphs_;
     std::unique_ptr<DecodeGraph> stream_decode_graph_;
     std::unique_ptr<LatentDecodeGraph> latent_decode_graph_;
 };

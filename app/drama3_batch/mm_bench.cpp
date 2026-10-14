@@ -4,6 +4,7 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <ggml.h>
 
@@ -92,6 +93,24 @@ int main(int argc, char ** argv) {
             auto * ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             ggml_gallocr_alloc_graph(ga, g);
             ggml_backend_graph_compute(backend, g);
+            if (!c.experts && std::getenv("MMB_CHECK")) {
+                // host reference for the first copy
+                const int64_t K = c.k, M = c.m;
+                std::vector<uint8_t> wq(ggml_nbytes(w[0]));
+                ggml_backend_tensor_get(w[0], wq.data(), 0, wq.size());
+                std::vector<float> wf(K * M), xf(K * n), yf(M * n);
+                if (c.type == GGML_TYPE_F32) std::memcpy(wf.data(), wq.data(), wq.size());
+                else ggml_get_type_traits(c.type)->to_float(wq.data(), wf.data(), K * M);
+                ggml_backend_tensor_get(x, xf.data(), 0, xf.size() * 4);
+                ggml_backend_tensor_get(ggml_graph_node(g, 0), yf.data(), 0, yf.size() * 4);
+                double maxerr = 0, maxref = 0;
+                for (int j = 0; j < n; ++j) for (int64_t i = 0; i < M; ++i) {
+                    double ref = 0;
+                    for (int64_t k = 0; k < K; ++k) ref += (double) wf[i * K + k] * xf[j * K + k];
+                    maxerr = std::max(maxerr, std::fabs(ref - yf[j * M + i])); maxref = std::max(maxref, std::fabs(ref));
+                }
+                std::printf("  check n=%d: max abs err %.3g (max |ref| %.3g)\n", n, maxerr, maxref);
+            }
             const auto t0 = std::chrono::steady_clock::now();
             for (int r = 0; r < reps; ++r) ggml_backend_graph_compute(backend, g);
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps / ncopy;

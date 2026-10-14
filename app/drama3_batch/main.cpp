@@ -18,6 +18,7 @@
 #include "engine/framework/audio/wav_reader.h"
 #include "engine/framework/audio/wav_writer.h"
 #include "engine/framework/core/execution_context.h"
+#include <ggml.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -107,8 +108,9 @@ int main(int argc, char ** argv) {
     Drama3BatchOptions opt;
     int64_t max_frames = 0, limit = 0;
     uint64_t seed_base = 0;
-    std::string codec_mode = "cpu";
+    std::string codec_mode = "gpu";
     int64_t codec_bench = 0;
+    std::string save_codes_dir;
     int decode_workers = 6;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -131,11 +133,33 @@ int main(int argc, char ** argv) {
         else if (a == "--verbose") opt.verbose = true;
         else if (a == "--codec") codec_mode = next();
         else if (a == "--codec-bench") codec_bench = std::stoll(next());
+        else if (a == "--save-codes") save_codes_dir = next();
         else if (a == "--decode-workers") decode_workers = std::stoi(next());
         else if (a == "--codec-threads") opt.codec_cpu_threads = std::stoi(next());
         else if (a == "-h" || a == "--help") usage();
         else if (!a.empty() && a[0] == '-') { std::cerr << "unknown option " << a << "\n"; usage(); }
         else jobs_path = a;
+    }
+    if (const char * names = getenv("D3_CHECK_RAW")) {
+        // Compare raw GGUF bytes with what the weight store loads (TensorStorageType::Native) for comma-separated names.
+        auto assets = load_drama3_assets(model);
+        std::string all = names;
+        size_t pos = 0;
+        while (pos <= all.size()) {
+            const auto end = all.find(',', pos);
+            const auto name = all.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            pos = end == std::string::npos ? all.size() + 1 : end + 1;
+            const auto meta = assets->model_weights->require_metadata(name);
+            const auto raw = assets->model_weights->require_tensor_data(name);
+            const auto native = assets->model_weights->require_tensor(name, engine::assets::TensorStorageType::Native, meta.shape);
+            size_t diff = 0;
+            for (size_t i = 0; i < std::min(raw.bytes.size(), native.bytes.size()); ++i) diff += raw.bytes[i] != native.bytes[i];
+            std::cerr << name << " dtype=" << meta.dtype << " shape=";
+            for (auto d : meta.shape) std::cerr << d << ",";
+            std::cerr << " raw=" << raw.bytes.size() << " native=" << native.bytes.size() << " type=" << ggml_type_name(native.type)
+                      << " differing bytes=" << diff << "\n";
+        }
+        return 0;
     }
     if (codec_bench > 0 && !model.empty()) {
         // CPU codec throughput test: decode the first cached reference code file with N workers in parallel.
@@ -211,6 +235,8 @@ int main(int argc, char ** argv) {
     std::cerr << "[drama3_batch] " << lines.size() << " lines to generate\n";
     if (lines.empty()) return 0;
 
+    setenv("FISH_DAC_DECODE_BUCKET", "32", 0);  // decode graphs per 32-frame bucket (see fish_dac_codec_runtime.cpp)
+    setenv("FISH_DAC_DECODE_GRAPHS", "3", 0);
     if (codec_mode == "cpu") opt.codec_cpu_workers = decode_workers;
     else if (codec_mode != "gpu") usage();
     const auto t_load = Clock::now();
@@ -295,8 +321,11 @@ int main(int argc, char ** argv) {
         }
     };
     std::vector<std::thread> workers;
-    if (codec_mode == "cpu") {
-        for (int w = 0; w < decode_workers; ++w) {
+    // GPU codec: one worker thread with the codec's own Vulkan backend, overlapping generation. CPU codec: N workers.
+    const bool threaded_gpu = codec_mode == "gpu" && getenv("D3_ASYNC_DECODE") != nullptr;
+    if (codec_mode == "cpu" || threaded_gpu) {
+        const int nworkers = codec_mode == "cpu" ? decode_workers : 1;
+        for (int w = 0; w < nworkers; ++w) {
             workers.emplace_back([&, w]() {
                 while (true) {
                     Drama3BatchResult r;
@@ -308,18 +337,24 @@ int main(int argc, char ** argv) {
                         pending.pop_front();
                     }
                     const auto t_dec = Clock::now();
-                    auto audio = engine.decode_cpu(w, r.codes);
+                    auto audio = codec_mode == "cpu" ? engine.decode_cpu(w, r.codes) : engine.decode(r.codes);
                     write_one(r, std::move(audio), std::chrono::duration<double>(Clock::now() - t_dec).count());
                 }
             });
         }
     }
+    if (!save_codes_dir.empty()) fs::create_directories(save_codes_dir);
     engine.run(jobs, [&](Drama3BatchResult && r) {
+        if (!save_codes_dir.empty()) {
+            std::string n = r.id;
+            std::replace(n.begin(), n.end(), '/', '_');
+            save_codes(fs::path(save_codes_dir) / (n + ".codes"), r.codes);
+        }
         if (r.codes.frames == 0) {
             std::cerr << "[drama3_batch] " << r.id << ": no frames generated, skipped\n";
             return;
         }
-        if (codec_mode == "cpu") {
+        if (codec_mode == "cpu" || threaded_gpu) {
             std::lock_guard<std::mutex> lock(mu);
             pending.push_back(std::move(r));
             max_backlog = std::max(max_backlog, pending.size());

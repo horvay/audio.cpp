@@ -292,8 +292,11 @@ private:
     // Loads tensors that share an input as one weight with their rows concatenated, so one matmul replaces
     // several. With experts > 0 the parts are [experts, rows, inner] banks, concatenated per expert.
     // Returns nullptr (caller loads the parts separately) when the parts differ in type or shape.
-    ggml_tensor * load_fused(const std::vector<std::string> & names, int64_t inner, int64_t experts = 0) {
+    ggml_tensor * load_fused(const char * kind, const std::vector<std::string> & names, int64_t inner, int64_t experts = 0) {
         if (getenv("D3_NO_FUSE")) return nullptr;
+        if (const char * only = getenv("D3_FUSE")) {
+            if (std::string(",") .append(only).append(",").find(std::string(",") + kind + ",") == std::string::npos) return nullptr;
+        }
         const auto & source = *assets_->model_weights;
         ggml_type type = GGML_TYPE_COUNT;
         for (const auto & n : names) {
@@ -365,7 +368,7 @@ private:
             L.post_norm = norm(p + ".post_attention_layernorm.weight", b.hidden_size, true);
             if (L.full) {
                 const std::string a = p + ".self_attn";
-                L.att_in = load_fused({a + ".q_proj.weight", a + ".k_proj.weight", a + ".v_proj.weight"}, b.hidden_size);
+                L.att_in = load_fused("att", {a + ".q_proj.weight", a + ".k_proj.weight", a + ".v_proj.weight"}, b.hidden_size);
                 if (!L.att_in) {
                     L.wq = load(a + ".q_proj.weight", {b.heads * b.head_dim * 2, b.hidden_size});
                     L.wk = load(a + ".k_proj.weight", {b.kv_heads * b.head_dim, b.hidden_size});
@@ -376,7 +379,7 @@ private:
                 L.k_norm = norm(a + ".k_norm.weight", b.head_dim, true);
             } else {
                 const std::string a = p + ".linear_attn";
-                L.dn_in = load_fused({a + ".in_proj_qkv.weight", a + ".in_proj_z.weight", a + ".in_proj_b.weight",
+                L.dn_in = load_fused("dn", {a + ".in_proj_qkv.weight", a + ".in_proj_z.weight", a + ".in_proj_b.weight",
                                       a + ".in_proj_a.weight"}, b.hidden_size);
                 if (!L.dn_in) {
                     L.w_qkv = load(a + ".in_proj_qkv.weight", {conv_dim, b.hidden_size});
@@ -395,18 +398,18 @@ private:
                 L.w_out = load(a + ".out_proj.weight", {b.hidden_size, value_dim});
             }
             const std::string m = p + ".mlp";
-            L.sh_gate_up = load_fused({m + ".shared_expert.gate_proj.weight", m + ".shared_expert.up_proj.weight"}, b.hidden_size);
+            L.sh_gate_up = load_fused("sh", {m + ".shared_expert.gate_proj.weight", m + ".shared_expert.up_proj.weight"}, b.hidden_size);
             if (!L.sh_gate_up) {
                 L.sh_gate = load(m + ".shared_expert.gate_proj.weight", {b.intermediate_size, b.hidden_size});
                 L.sh_up = load(m + ".shared_expert.up_proj.weight", {b.intermediate_size, b.hidden_size});
             }
             L.sh_down = load(m + ".shared_expert.down_proj.weight", {b.hidden_size, b.intermediate_size});
-            L.route = load_fused({m + ".gate.weight", m + ".shared_expert_gate.weight"}, b.hidden_size);
+            L.route = load_fused("route", {m + ".gate.weight", m + ".shared_expert_gate.weight"}, b.hidden_size);
             if (!L.route) {
                 L.router = load(m + ".gate.weight", {b.experts, b.hidden_size});
                 L.sh_scale = load(m + ".shared_expert_gate.weight", {1, b.hidden_size});
             }
-            L.exp_gate_up = load_fused({m + ".experts.gate_proj.weight", m + ".experts.up_proj.weight"}, b.hidden_size, b.experts);
+            L.exp_gate_up = load_fused("exp", {m + ".experts.gate_proj.weight", m + ".experts.up_proj.weight"}, b.hidden_size, b.experts);
             if (!L.exp_gate_up) {
                 L.exp_gate = load(m + ".experts.gate_proj.weight", {b.experts, b.intermediate_size, b.hidden_size});
                 L.exp_up = load(m + ".experts.up_proj.weight", {b.experts, b.intermediate_size, b.hidden_size});
@@ -448,7 +451,7 @@ private:
             w.q_norm = norm(x + ".attention.q_norm.weight", t.head_dim, true);
             w.k_norm = norm(x + ".attention.k_norm.weight", t.head_dim, true);
             w.wo = load(x + ".attention.wo.weight", {t.hidden_size, qw});
-            w.w13 = load_fused({x + ".feed_forward.w1.weight", x + ".feed_forward.w3.weight"}, t.hidden_size);
+            w.w13 = load_fused("tower", {x + ".feed_forward.w1.weight", x + ".feed_forward.w3.weight"}, t.hidden_size);
             if (!w.w13) {
                 w.w1 = load(x + ".feed_forward.w1.weight", {t.intermediate_size, t.hidden_size});
                 w.w3 = load(x + ".feed_forward.w3.weight", {t.intermediate_size, t.hidden_size});
@@ -591,14 +594,14 @@ private:
         if (L.att_in) {
             auto * y = ggml_mul_mat(ctx, L.att_in, x);  // [qw + 2 kw, N]
             qg = y;
-            k = ggml_cont(ctx, ggml_view_3d(ctx, y, D, b.kv_heads, N, D * sizeof(float), y->nb[1], qw * sizeof(float)));
+            k = ggml_view_3d(ctx, y, D, b.kv_heads, N, D * sizeof(float), y->nb[1], qw * sizeof(float));
             v = ggml_cont(ctx, ggml_view_2d(ctx, y, kw, N, y->nb[1], (qw + kw) * sizeof(float)));
         } else {
             qg = ggml_mul_mat(ctx, L.wq, x);  // [2D * heads, N], per head [q | gate]
             k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, L.wk, x), D, b.kv_heads, N);
             v = ggml_mul_mat(ctx, L.wv, x);
         }
-        auto * q = ggml_cont(ctx, ggml_view_3d(ctx, qg, D, b.heads, N, 2 * D * sizeof(float), qg->nb[1], 0));
+        auto * q = ggml_view_3d(ctx, qg, D, b.heads, N, 2 * D * sizeof(float), qg->nb[1], 0);  // rms_norm takes strided input
         auto * gate = ggml_cont(ctx, ggml_view_3d(ctx, qg, D, b.heads, N, 2 * D * sizeof(float), qg->nb[1], D * sizeof(float)));
         const int rot = static_cast<int>(std::llround(D * static_cast<double>(b.partial_rotary_factor)));
         q = ggml_rope_ext(ctx, norm(ctx, q, L.q_norm, b.rms_norm_eps), g.pos, nullptr, rot, GGML_ROPE_TYPE_NEOX, 0,
@@ -645,14 +648,13 @@ private:
         auto * q = ggml_view_4d(ctx, conv, dk, hk, T, S, dk * sizeof(float), conv->nb[1], conv->nb[2], 0);
         auto * k = ggml_view_4d(ctx, conv, dk, hk, T, S, dk * sizeof(float), conv->nb[1], conv->nb[2], key_dim * sizeof(float));
         auto * v = ggml_view_4d(ctx, conv, dv, hv, T, S, dv * sizeof(float), conv->nb[1], conv->nb[2], 2 * key_dim * sizeof(float));
-        q = ggml_l2_norm(ctx, ggml_cont(ctx, q), 1.0e-6F);
-        k = ggml_l2_norm(ctx, ggml_cont(ctx, k), 1.0e-6F);
+        q = ggml_l2_norm(ctx, q, 1.0e-6F);  // rows are contiguous inside the strided view
+        k = ggml_l2_norm(ctx, k, 1.0e-6F);
         const int64_t rep = hv / hk;
         if (rep > 1) {  // value head h reads key head h / rep
             q = ggml_reshape_4d(ctx, ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, q, dk, 1, hk, N), dk, rep, hk, N), dk, hv, T, S);
             k = ggml_reshape_4d(ctx, ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, k, dk, 1, hk, N), dk, rep, hk, N), dk, hv, T, S);
         }
-        v = ggml_cont(ctx, v);
         auto * beta = ggml_reshape_4d(ctx, ggml_sigmoid(ctx, beta_in), 1, hv, T, S);
         auto * a = ggml_softplus(ctx, ggml_add(ctx, a_in, L.dt_bias));
         auto * gate = ggml_reshape_4d(ctx, ggml_mul(ctx, a, L.neg_a), 1, hv, T, S);
@@ -699,11 +701,14 @@ private:
         }
         auto * experts = ggml_mul_mat_id(ctx, L.exp_down, act, selected);  // [hidden, K, N]
         experts = ggml_mul(ctx, experts, weights);
-        ggml_tensor * out = nullptr;
+        // Expand the expert views first so the adds are consecutive and ggml-vulkan fuses them into one multi_add.
+        std::vector<ggml_tensor *> parts;
         for (int64_t e = 0; e < K; ++e) {
-            auto * one = ggml_view_2d(ctx, experts, b.hidden_size, N, experts->nb[2], e * experts->nb[1]);
-            out = out ? ggml_add(ctx, out, one) : one;
+            parts.push_back(ggml_view_2d(ctx, experts, b.hidden_size, N, experts->nb[2], e * experts->nb[1]));
+            ggml_build_forward_expand(graph_, parts.back());
         }
+        ggml_tensor * out = parts[0];
+        for (int64_t e = 1; e < K; ++e) out = ggml_add(ctx, out, parts[e]);
         auto * shared_act = L.sh_gate_up ? ggml_swiglu(ctx, ggml_mul_mat(ctx, L.sh_gate_up, x))
                                          : ggml_swiglu_split(ctx, ggml_mul_mat(ctx, L.sh_gate, x), ggml_mul_mat(ctx, L.sh_up, x));
         auto * shared = ggml_mul(ctx, ggml_mul_mat(ctx, L.sh_down, shared_act), shared_scale);
@@ -721,9 +726,9 @@ private:
         auto * mixed = ggml_mul_mat(ctx, w.eh, ggml_concat(ctx, norm(ctx, e, w.enorm, c.norm_eps),
                                                            norm(ctx, hidden, w.hnorm, c.norm_eps), 0));
         auto * qkv = ggml_mul_mat(ctx, w.qkv, norm(ctx, mixed, w.in_norm, c.norm_eps));  // [2qw + 2kw, N]
-        auto * q = ggml_cont(ctx, ggml_view_3d(ctx, qkv, D, c.heads, N, D * sizeof(float), qkv->nb[1], 0));
+        auto * q = ggml_view_3d(ctx, qkv, D, c.heads, N, D * sizeof(float), qkv->nb[1], 0);
         auto * gate = ggml_cont(ctx, ggml_view_2d(ctx, qkv, qw, N, qkv->nb[1], qw * sizeof(float)));
-        auto * k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, D, c.kv_heads, N, D * sizeof(float), qkv->nb[1], 2 * qw * sizeof(float)));
+        auto * k = ggml_view_3d(ctx, qkv, D, c.kv_heads, N, D * sizeof(float), qkv->nb[1], 2 * qw * sizeof(float));
         auto * v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kw, N, qkv->nb[1], (2 * qw + kw) * sizeof(float)));
         const int rot = static_cast<int>(D * c.rotary_fraction);
         q = ggml_rope_ext(ctx, norm(ctx, q, w.q_norm, c.norm_eps), g.pos, nullptr, rot, GGML_ROPE_TYPE_NORMAL, 0,
@@ -786,6 +791,7 @@ private:
         g->ctx.reset(ggml_init(params));
         auto * ctx = g->ctx.get();
         g->graph = ggml_new_graph_custom(ctx, 32768, false);
+        graph_ = g->graph;
         const int64_t N = T * S, H = b.hidden_size;
         auto input = [&](ggml_type type, std::initializer_list<int64_t> ne) {
             std::vector<int64_t> d(ne);
@@ -911,7 +917,29 @@ private:
         const auto suffix = suffix_frames("x");
         if (full.size() <= suffix.size()) throw std::runtime_error("Drama 3 prompt split failed");
         full.resize(full.size() - suffix.size());
+        const auto head = suffix_head();
+        full.insert(full.end(), head.begin(), head.end());
         return full;
+    }
+    // Leading suffix tokens shared by every line ("<|im_start|>user\n<|speaker:0|>"): they go into the cached
+    // voice prefix instead of being teacher-forced for every line.
+    std::vector<Drama3Frame> suffix_head() const {
+        if (!suffix_head_.empty() || getenv("D3_NO_SUFFIX_HEAD")) return suffix_head_;
+        const auto a = suffix_frames("Hello there.");
+        const auto b = suffix_frames("[sighs] What now?");
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && a[n] == b[n]) ++n;
+        suffix_head_.assign(a.begin(), a.begin() + static_cast<long>(n));
+        return suffix_head_;
+    }
+    std::vector<Drama3Frame> job_suffix(const std::string & text) const {
+        auto s = suffix_frames(text);
+        const auto head = suffix_head();
+        if (s.size() <= head.size() || !std::equal(head.begin(), head.end(), s.begin())) {
+            throw std::runtime_error("Drama 3 batch: line text does not start like the cached prefix: " + text);
+        }
+        s.erase(s.begin(), s.begin() + static_cast<long>(head.size()));
+        return s;
     }
     std::vector<Drama3Frame> suffix_frames(const std::string & text) const {
         validate_drama3_text(text, "input");
@@ -959,13 +987,13 @@ private:
     void prefill_voice(const Drama3Voice & voice, int slot) {
         const auto start = Clock::now();
         auto prefix = prefix_frames(voice);
-        const auto first_suffix = suffix_frames("x").front();
+        const auto first_suffix = job_suffix("x").front();
         {   // The cached prefix plus the forced suffix must equal the reference prompt builder's output.
             const std::string probe = "[sighs] Hello there, friend.";
             Drama3Take take{voice.reference_text, voice.codes};
             const auto full = build_drama3_prompt(*assets_, tokenizer_, probe, {take}, {});
             auto joined = prefix;
-            const auto tail = suffix_frames(probe);
+            const auto tail = job_suffix(probe);
             joined.insert(joined.end(), tail.begin(), tail.end());
             if (joined != full) throw std::runtime_error("Drama 3 batch prompt split does not match the prompt builder");
         }
@@ -1067,7 +1095,7 @@ private:
         row = Row{};
         row.active = true;
         row.job = job;
-        row.suffix = suffix_frames(job.text);
+        row.suffix = job_suffix(job.text);
         row.forced = 0;
         const int64_t prefix = voice_prefix_len_.at(job.voice->key);
         row.position = prefix;
@@ -1215,6 +1243,8 @@ private:
     std::vector<Row> rows_;
     std::unordered_map<int, bool> row_finished_, row_limited_;
     std::vector<std::string> voice_slot_key_;
+    mutable std::vector<Drama3Frame> suffix_head_;
+    ggml_cgraph * graph_ = nullptr;  // graph being built
     std::list<int> voice_lru_;
     std::unordered_map<std::string, int64_t> voice_prefix_len_;
     std::vector<int32_t> tok_, pos_, kv_, out_;

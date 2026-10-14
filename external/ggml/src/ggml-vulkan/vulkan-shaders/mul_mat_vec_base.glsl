@@ -46,7 +46,9 @@ uint expert_id;
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
-    const uint expert_i0 = gl_WorkGroupID.y;
+    // y covers (token, expert slot) pairs: one dispatch can run all tokens (p.expert_i1 is the first token).
+    const uint expert_i0 = gl_WorkGroupID.y % p.nei0;
+    const uint expert_i1 = p.expert_i1 + gl_WorkGroupID.y / p.nei0;
 #else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 #endif
@@ -63,7 +65,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         batch_idx_a = i03 * p.ne02 + i02;
     }
 #else
-    expert_id = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
+    expert_id = data_ids[expert_i0 + expert_i1 * p.nbi1];
 #endif
 
     a_offset =
@@ -74,13 +76,13 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
     b_offset =
 #ifdef MUL_MAT_ID
-            (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+            (expert_i0 % p.ne11) * p.stride_b + expert_i1 * p.batch_stride_b;
 #else
             batch_idx * p.batch_stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
-            expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+            expert_i0 * p.stride_d + expert_i1 * p.batch_stride_d;
 #else
             batch_idx * p.batch_stride_d;
 #endif
