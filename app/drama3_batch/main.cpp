@@ -4,7 +4,7 @@
 //   voice     a reference wav path, or a name looked up as <--voices-dir>/<name>.wav
 //   ref_text  what the reference says; defaults to the <voice>.txt sidecar
 // Writes <--out>/<out_name>.wav (44.1 kHz mono, 16-bit). Existing outputs are skipped, so runs resume.
-// Text may contain Drama 3 inline tags such as [whispering] or [sighs].
+// Text may contain Drama 3 inline tags such as [whispering] or [sighs]; [crying] and [sobbing] are read as [tearful].
 //
 // usage:
 //   drama3_batch <jobs.tsv> --model drama-3.gguf --voices-dir DIR --out DIR
@@ -21,6 +21,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -92,6 +93,45 @@ bool load_codes(const fs::path & p, engine::codecs::FishDacCodes & c) {
     c.frames = head[1];
     c.codes.resize(static_cast<size_t>(head[0] * head[1]));
     return static_cast<bool>(in.read(reinterpret_cast<char *>(c.codes.data()), static_cast<std::streamsize>(c.codes.size() * 4)));
+}
+
+// Drama 3 tends to produce long crying with few words for [crying]/[sobbing] (seen in the spike and the eval set),
+// so those tags are read as [tearful]. Returns the number of tags replaced.
+int swap_crying_tags(std::string & text) {
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = text.find('[', pos)) != std::string::npos) {
+        const auto end = text.find(']', pos);
+        if (end == std::string::npos) break;
+        std::string tag = text.substr(pos + 1, end - pos - 1);
+        for (auto & c : tag) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (tag.find("crying") != std::string::npos || tag.find("sobbing") != std::string::npos) {
+            text.replace(pos, end - pos + 1, "[tearful]");
+            ++count;
+            pos += 9;
+        } else {
+            pos = end + 1;
+        }
+    }
+    return count;
+}
+
+// Frame cap from the text: generous for normal speech (median is ~1.8 frames per spoken character), so a line that
+// reaches it is almost always a runaway take and gets regenerated with another seed.
+int64_t frame_cap(const std::string & text) {
+    int64_t chars = 0, pauses = 0;
+    bool in_tag = false;
+    std::string tag;
+    for (char ch : text) {
+        if (ch == '[') { in_tag = true; tag.clear(); continue; }
+        if (in_tag) {
+            if (ch == ']') { in_tag = false; if (tag.find("pause") != std::string::npos || tag.find("silence") != std::string::npos) ++pauses; }
+            else tag += ch;
+            continue;
+        }
+        ++chars;
+    }
+    return 100 + chars * 9 / 2 + pauses * 65;
 }
 
 [[noreturn]] void usage() {
@@ -196,6 +236,7 @@ int main(int argc, char ** argv) {
 
     // Read jobs, skipping finished outputs.
     std::vector<Line> lines;
+    int swapped_tags = 0;
     {
         std::ifstream in(jobs_path);
         if (!in) { std::cerr << "cannot read " << jobs_path << "\n"; return 1; }
@@ -209,6 +250,7 @@ int main(int argc, char ** argv) {
             l.name = f[0];
             l.voice = f[1];
             l.text = f[2];
+            swapped_tags += swap_crying_tags(l.text);
             std::string out_name = l.name;
             if (out_name.size() < 4 || out_name.substr(out_name.size() - 4) != ".wav") out_name += ".wav";
             l.out = fs::path(out_dir) / out_name;
@@ -232,7 +274,9 @@ int main(int argc, char ** argv) {
         return a.text.size() > b.text.size();
     });
     if (limit > 0 && static_cast<int64_t>(lines.size()) > limit) lines.resize(static_cast<size_t>(limit));
-    std::cerr << "[drama3_batch] " << lines.size() << " lines to generate\n";
+    std::cerr << "[drama3_batch] " << lines.size() << " lines to generate";
+    if (swapped_tags) std::cerr << " (" << swapped_tags << " [crying]/[sobbing] tags read as [tearful])";
+    std::cerr << "\n";
     if (lines.empty()) return 0;
 
     setenv("FISH_DAC_DECODE_BUCKET", "32", 0);  // decode graphs per 32-frame bucket (see fish_dac_codec_runtime.cpp)
@@ -279,7 +323,7 @@ int main(int argc, char ** argv) {
         j.id = l.name;
         j.voice = voices.at(l.wav.string() + "\n" + l.ref_text);
         j.text = l.text;
-        j.max_frames = max_frames;
+        j.max_frames = max_frames > 0 ? max_frames : frame_cap(l.text);
         j.seed = static_cast<uint32_t>(fnv1a(l.name) ^ seed_base);
         jobs.push_back(std::move(j));
         by_id[l.name] = &l;
@@ -344,7 +388,17 @@ int main(int argc, char ** argv) {
         }
     }
     if (!save_codes_dir.empty()) fs::create_directories(save_codes_dir);
-    engine.run(jobs, [&](Drama3BatchResult && r) {
+    std::map<std::string, int> attempts;
+    std::ofstream limited_log(fs::path(out_dir) / "limited.tsv", std::ios::app);
+    auto on_done = [&](Drama3BatchResult && r) {
+        if (r.reached_limit && attempts[r.id]++ == 0) {
+            // Runaway take: regenerate once with another seed, in the same running batch.
+            for (const auto & j : jobs) if (j.id == r.id) { auto k = j; k.seed ^= 0x9e3779b9U; engine.requeue(k); }
+            limited_log << r.id << "\tretry\t" << r.codes.frames << "\n";
+            limited_log.flush();
+            return;
+        }
+        if (r.reached_limit) { limited_log << r.id << "\tkept\t" << r.codes.frames << "\n"; limited_log.flush(); }
         if (!save_codes_dir.empty()) {
             std::string n = r.id;
             std::replace(n.begin(), n.end(), '/', '_');
@@ -364,7 +418,8 @@ int main(int argc, char ** argv) {
         const auto t_dec = Clock::now();
         auto audio = engine.decode(r.codes);
         write_one(r, std::move(audio), std::chrono::duration<double>(Clock::now() - t_dec).count());
-    });
+    };
+    engine.run(jobs, on_done);
     const double gpu_s = std::chrono::duration<double>(Clock::now() - t_gen).count();
     {
         std::lock_guard<std::mutex> lock(mu);

@@ -59,7 +59,8 @@ int main(int argc, char ** argv) {
     const char * only = std::getenv("MMB_ONLY");
     for (const auto & c : cases) {
         if (only && c.name.find(only) == std::string::npos) continue;
-        for (int n : {1, 8, 16, 32, 48, 64}) {
+        static const std::vector<int> ns = std::getenv("MMB_NS") ? [](){ std::vector<int> v; std::string s = std::getenv("MMB_NS"); size_t p = 0; while (p < s.size()) { auto e = s.find(',', p); v.push_back(std::stoi(s.substr(p, e == std::string::npos ? std::string::npos : e - p))); if (e == std::string::npos) break; p = e + 1; } return v; }() : std::vector<int>{1, 8, 16, 32, 48, 64};
+        for (int n : ns) {
             ggml_init_params p{256 * ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false), nullptr, true};
             auto * ctx = ggml_init(p);
             const int ncopy = c.experts ? 6 : copies;
@@ -116,7 +117,9 @@ int main(int argc, char ** argv) {
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps / ncopy;
             const double bytes = static_cast<double>(ggml_nbytes(w[0])) /
                 (c.experts ? static_cast<double>(c.experts) / std::min<double>(c.experts, c.experts * (1 - std::pow(1 - 8.0 / c.experts, n))) : 1.0);
-            std::printf("%-18s n=%3d  %8.1f us   %6.0f GB/s (weights touched)\n", c.name.c_str(), n, us, bytes / us / 1e3);
+            const double macs = static_cast<double>(c.m) * c.k * n * (c.experts ? 8 : 1);
+            std::printf("%-18s n=%3d  %8.1f us   %6.0f GB/s (weights touched)  %5.2f TMAC/s\n", c.name.c_str(), n, us,
+                        bytes / us / 1e3, macs / us / 1e6);
             std::fflush(stdout);
             ggml_gallocr_free(ga);
             ggml_free(gctx);

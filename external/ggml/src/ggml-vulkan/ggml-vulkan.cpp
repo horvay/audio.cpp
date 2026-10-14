@@ -7446,6 +7446,15 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
 
     if (ctx->device->coopmat2) {
+        // GGML_VK_CM2_TILE=s|m|l forces the coopmat2 tile size. On BMG the small tile is ~10x slower per column
+        // than the medium/large ones, so small-n matmuls are faster padded into a medium tile.
+        static const char * forced_tile = getenv("GGML_VK_CM2_TILE");
+        static const uint32_t forced_max_n = getenv("GGML_VK_CM2_TILE_MAX_N") ? (uint32_t) std::stoul(getenv("GGML_VK_CM2_TILE_MAX_N")) : 256;
+        if (forced_tile && n <= forced_max_n) {
+            if (forced_tile[0] == 'l' && mm_l) return aligned ? mmp->a_l : mmp->l;
+            if (forced_tile[0] == 'm' && mm_m) return aligned ? mmp->a_m : mmp->m;
+            if (forced_tile[0] == 's' && mm_s) return aligned ? mmp->a_s : mmp->s;
+        }
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);

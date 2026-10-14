@@ -84,6 +84,8 @@ public:
 
     // Generates every job. Calls done() as each row finishes (in finishing order).
     void run(const std::vector<Drama3BatchJob> & jobs, const std::function<void(Drama3BatchResult &&)> & done);
+    // Adds a job to the running queue (callable from the done() callback, e.g. to regenerate a runaway line).
+    void requeue(const Drama3BatchJob & job);
 
     const Drama3BatchStats & stats() const;
     void reset_stats();

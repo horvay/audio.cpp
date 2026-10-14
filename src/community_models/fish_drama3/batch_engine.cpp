@@ -135,7 +135,8 @@ struct BackboneLayer {
     ggml_tensor * key_cache = nullptr;    // f16 [kv_width, capacity, slots]
     ggml_tensor * value_cache = nullptr;
     ggml_tensor * conv_tail = nullptr;    // f32 [kernel - 1, conv_dim, slots]
-    ggml_tensor * state = nullptr;        // f32 [S_v * S_v * H, slots]
+    ggml_tensor * state = nullptr;        // f32 [S_v * S_v * H, slots], view into gdn_buffer
+    ggml_tensor * gdn_buffer = nullptr;   // f32: [decode attention output rows][state slots]
 };
 
 struct TowerLayer {
@@ -246,15 +247,16 @@ public:
     }
 
     void run(const std::vector<Drama3BatchJob> & jobs, const std::function<void(Drama3BatchResult &&)> & done) {
-        std::deque<const Drama3BatchJob *> queue;
-        for (const auto & job : jobs) queue.push_back(&job);
+        queue_.clear();
+        for (const auto & job : jobs) queue_.push_back(job);
         int active = 0;
-        while (!queue.empty() || active > 0) {
+        while (!queue_.empty() || active > 0) {
             // Fill free rows.
-            for (int r = 0; r < opt_.batch && !queue.empty(); ++r) {
+            for (int r = 0; r < opt_.batch && !queue_.empty(); ++r) {
                 if (rows_[r].active) continue;
-                admit(r, *queue.front());
-                queue.pop_front();
+                const auto job = queue_.front();
+                queue_.pop_front();
+                admit(r, job);
                 ++active;
             }
             step();
@@ -282,6 +284,7 @@ public:
     }
 
     Drama3BatchStats stats_;
+    std::deque<Drama3BatchJob> queue_;
 
 private:
     // ------------------------------------------------------------------ loading
@@ -500,7 +503,12 @@ private:
                 L.value_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, b.kv_heads * b.head_dim, opt_.capacity, slots_);
             } else {
                 L.conv_tail = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, b.linear_conv_kernel_dim - 1, conv_dim, slots_);
-                L.state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, state_values, slots_);
+                // The decode graph's gated delta net writes [attention rows | new states] straight into this
+                // buffer, so its state section is the persistent state (no copy back).
+                const int64_t scratch = static_cast<int64_t>(opt_.batch) * value_dim;
+                L.gdn_buffer = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scratch + state_values * slots_);
+                L.state = ggml_view_2d(ctx, L.gdn_buffer, state_values, slots_, state_values * sizeof(float),
+                                       scratch * sizeof(float));
             }
         }
         for (auto & w : tower_) {
@@ -546,6 +554,21 @@ public:
 private:
 
     // ------------------------------------------------------------------ graph
+    // Dense matmul. D3_PAD_N=P pads the activation columns up to P (zeros) for weights of the types listed in
+    // D3_PAD_TYPES (default f16), when that width runs on a much faster kernel than the real one.
+    ggml_tensor * mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
+        static const int64_t pad_n = getenv("D3_PAD_N") ? std::atoll(getenv("D3_PAD_N")) : 0;
+        static const std::string pad_types = getenv("D3_PAD_TYPES") ? getenv("D3_PAD_TYPES") : "f16";
+        static const int64_t pad_min_m = getenv("D3_PAD_MIN_M") ? std::atoll(getenv("D3_PAD_MIN_M")) : 0;
+        const int64_t n = x->ne[1];
+        if (pad_n > n && n > 1 && ggml_n_dims(x) == 2 && w->ne[1] >= pad_min_m &&
+            pad_types.find(ggml_type_name(w->type)) != std::string::npos) {
+            auto * y = ggml_mul_mat(ctx, w, ggml_pad(ctx, ggml_cont(ctx, x), 0, static_cast<int>(pad_n - n), 0, 0));
+            return ggml_view_2d(ctx, y, y->ne[0], n, y->nb[1], 0);
+        }
+        return ggml_mul_mat(ctx, w, x);
+    }
+
     ggml_tensor * norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, float eps) {
         return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
     }
@@ -592,14 +615,14 @@ private:
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         if (L.att_in) {
-            auto * y = ggml_mul_mat(ctx, L.att_in, x);  // [qw + 2 kw, N]
+            auto * y = mm(ctx, L.att_in, x);  // [qw + 2 kw, N]
             qg = y;
             k = ggml_view_3d(ctx, y, D, b.kv_heads, N, D * sizeof(float), y->nb[1], qw * sizeof(float));
             v = ggml_cont(ctx, ggml_view_2d(ctx, y, kw, N, y->nb[1], (qw + kw) * sizeof(float)));
         } else {
-            qg = ggml_mul_mat(ctx, L.wq, x);  // [2D * heads, N], per head [q | gate]
-            k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, L.wk, x), D, b.kv_heads, N);
-            v = ggml_mul_mat(ctx, L.wv, x);
+            qg = mm(ctx, L.wq, x);  // [2D * heads, N], per head [q | gate]
+            k = ggml_reshape_3d(ctx, mm(ctx, L.wk, x), D, b.kv_heads, N);
+            v = mm(ctx, L.wv, x);
         }
         auto * q = ggml_view_3d(ctx, qg, D, b.heads, N, 2 * D * sizeof(float), qg->nb[1], 0);  // rms_norm takes strided input
         auto * gate = ggml_cont(ctx, ggml_view_3d(ctx, qg, D, b.heads, N, 2 * D * sizeof(float), qg->nb[1], D * sizeof(float)));
@@ -610,7 +633,7 @@ private:
                           b.rope_theta, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
         auto * att = attention(ctx, g, q, k, v, L.key_cache, L.value_cache, D, b.heads, b.kv_heads);
         att = ggml_mul(ctx, att, ggml_sigmoid(ctx, ggml_reshape_2d(ctx, gate, D * b.heads, N)));
-        return ggml_mul_mat(ctx, L.wo, att);
+        return mm(ctx, L.wo, att);
     }
 
     ggml_tensor * delta_net(ggml_context * ctx, StepGraph & g, const BackboneLayer & L, ggml_tensor * x) {
@@ -626,16 +649,16 @@ private:
         ggml_tensor * beta_in = nullptr;
         ggml_tensor * a_in = nullptr;
         if (L.dn_in) {
-            auto * y = ggml_mul_mat(ctx, L.dn_in, x);  // [conv_dim + value_dim + 2 hv, N]
+            auto * y = mm(ctx, L.dn_in, x);  // [conv_dim + value_dim + 2 hv, N]
             qkv3 = ggml_view_3d(ctx, y, conv_dim, T, S, y->nb[1], T * y->nb[1], 0);
             z = ggml_cont(ctx, ggml_view_2d(ctx, y, value_dim, N, y->nb[1], conv_dim * sizeof(float)));
             beta_in = ggml_cont(ctx, ggml_view_2d(ctx, y, hv, N, y->nb[1], (conv_dim + value_dim) * sizeof(float)));
             a_in = ggml_cont(ctx, ggml_view_2d(ctx, y, hv, N, y->nb[1], (conv_dim + value_dim + hv) * sizeof(float)));
         } else {
-            qkv3 = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, L.w_qkv, x), conv_dim, T, S);
-            z = ggml_mul_mat(ctx, L.w_z, x);
-            beta_in = ggml_mul_mat(ctx, L.w_b, x);
-            a_in = ggml_mul_mat(ctx, L.w_a, x);
+            qkv3 = ggml_reshape_3d(ctx, mm(ctx, L.w_qkv, x), conv_dim, T, S);
+            z = mm(ctx, L.w_z, x);
+            beta_in = mm(ctx, L.w_b, x);
+            a_in = mm(ctx, L.w_a, x);
         }
         auto * qkv_t = ggml_cont(ctx, ggml_transpose(ctx, qkv3));  // [T, conv_dim, S]
         const size_t tail_slot = static_cast<size_t>((kernel - 1) * conv_dim) * sizeof(float);
@@ -662,12 +685,20 @@ private:
         auto * state = ggml_view_3d(ctx, L.state, state_values, 1, S, state_slot, state_slot, g.base * state_slot);
         auto * delta = ggml_gated_delta_net(ctx, q, k, v, gate, beta, state);
         auto * att = ggml_view_2d(ctx, delta, value_dim, N, delta->nb[1], 0);
-        ggml_build_forward_expand(g.graph, ggml_cpy(ctx,
-            ggml_view_1d(ctx, delta, state_values * S, N * value_dim * sizeof(float)),
-            ggml_view_1d(ctx, L.state, state_values * S, g.base * state_slot)));
+        static const bool copy_state = getenv("D3_GDN_INPLACE") == nullptr;  // in-place output segfaults; opt-in only
+        if (!copy_state && g.decode && g.base == 0 && T == 1 && S == opt_.batch) {
+            // Output in place: the attention rows land in the scratch, the new states on slots 0..S-1.
+            if (ggml_backend_tensor_alloc(state_buffer_, delta, L.gdn_buffer->data) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("Drama 3 batch: in-place delta net allocation failed");
+            }
+        } else {
+            ggml_build_forward_expand(g.graph, ggml_cpy(ctx,
+                ggml_view_1d(ctx, delta, state_values * S, N * value_dim * sizeof(float)),
+                ggml_view_1d(ctx, L.state, state_values * S, g.base * state_slot)));
+        }
         auto * o = norm(ctx, ggml_reshape_2d(ctx, att, dv, hv * N), L.lin_norm, b.rms_norm_eps);
         o = ggml_swiglu_split(ctx, ggml_reshape_2d(ctx, z, dv, hv * N), o);
-        return ggml_mul_mat(ctx, L.w_out, ggml_reshape_2d(ctx, o, value_dim, N));
+        return mm(ctx, L.w_out, ggml_reshape_2d(ctx, o, value_dim, N));
     }
 
     ggml_tensor * moe(ggml_context * ctx, const BackboneLayer & L, ggml_tensor * x, int64_t N) {
@@ -676,12 +707,12 @@ private:
         ggml_tensor * logits = nullptr;
         ggml_tensor * shared_scale = nullptr;
         if (L.route) {
-            auto * y = ggml_mul_mat(ctx, L.route, x);  // [E + 1, N]
+            auto * y = mm(ctx, L.route, x);  // [E + 1, N]
             logits = ggml_cont(ctx, ggml_view_2d(ctx, y, E, N, y->nb[1], 0));
             shared_scale = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_2d(ctx, y, 1, N, y->nb[1], E * sizeof(float))));
         } else {
-            logits = ggml_mul_mat(ctx, L.router, x);           // [E, N]
-            shared_scale = ggml_sigmoid(ctx, ggml_mul_mat(ctx, L.sh_scale, x));
+            logits = mm(ctx, L.router, x);           // [E, N]
+            shared_scale = ggml_sigmoid(ctx, mm(ctx, L.sh_scale, x));
         }
         auto * probs = ggml_soft_max(ctx, logits);
         auto * probs3 = ggml_reshape_3d(ctx, probs, 1, E, N);
@@ -709,9 +740,9 @@ private:
         }
         ggml_tensor * out = parts[0];
         for (int64_t e = 1; e < K; ++e) out = ggml_add(ctx, out, parts[e]);
-        auto * shared_act = L.sh_gate_up ? ggml_swiglu(ctx, ggml_mul_mat(ctx, L.sh_gate_up, x))
-                                         : ggml_swiglu_split(ctx, ggml_mul_mat(ctx, L.sh_gate, x), ggml_mul_mat(ctx, L.sh_up, x));
-        auto * shared = ggml_mul(ctx, ggml_mul_mat(ctx, L.sh_down, shared_act), shared_scale);
+        auto * shared_act = L.sh_gate_up ? ggml_swiglu(ctx, mm(ctx, L.sh_gate_up, x))
+                                         : ggml_swiglu_split(ctx, mm(ctx, L.sh_gate, x), mm(ctx, L.sh_up, x));
+        auto * shared = ggml_mul(ctx, mm(ctx, L.sh_down, shared_act), shared_scale);
         return ggml_add(ctx, out, shared);
     }
 
@@ -723,9 +754,9 @@ private:
         const int64_t D = c.head_dim, qw = c.heads * D, kw = c.kv_heads * D;
         auto * e = ggml_mul(ctx, ggml_get_rows(ctx, w.embedding, codes), g.label);
         if (index == 0) e = ggml_add(ctx, e, g.extra);
-        auto * mixed = ggml_mul_mat(ctx, w.eh, ggml_concat(ctx, norm(ctx, e, w.enorm, c.norm_eps),
+        auto * mixed = mm(ctx, w.eh, ggml_concat(ctx, norm(ctx, e, w.enorm, c.norm_eps),
                                                            norm(ctx, hidden, w.hnorm, c.norm_eps), 0));
-        auto * qkv = ggml_mul_mat(ctx, w.qkv, norm(ctx, mixed, w.in_norm, c.norm_eps));  // [2qw + 2kw, N]
+        auto * qkv = mm(ctx, w.qkv, norm(ctx, mixed, w.in_norm, c.norm_eps));  // [2qw + 2kw, N]
         auto * q = ggml_view_3d(ctx, qkv, D, c.heads, N, D * sizeof(float), qkv->nb[1], 0);
         auto * gate = ggml_cont(ctx, ggml_view_2d(ctx, qkv, qw, N, qkv->nb[1], qw * sizeof(float)));
         auto * k = ggml_view_3d(ctx, qkv, D, c.kv_heads, N, D * sizeof(float), qkv->nb[1], 2 * qw * sizeof(float));
@@ -737,12 +768,12 @@ private:
                           c.rope_theta, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F);
         auto * att = attention(ctx, g, q, k, v, w.key_cache, w.value_cache, D, c.heads, c.kv_heads);
         att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
-        auto * residual = ggml_add(ctx, mixed, ggml_mul_mat(ctx, w.wo, att));
+        auto * residual = ggml_add(ctx, mixed, mm(ctx, w.wo, att));
         auto * ff = norm(ctx, residual, w.post_norm, c.norm_eps);
-        auto * act = w.w13 ? ggml_swiglu(ctx, ggml_mul_mat(ctx, w.w13, ff))
-                           : ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w.w1, ff), ggml_mul_mat(ctx, w.w3, ff));
-        auto * out = norm(ctx, ggml_add(ctx, residual, ggml_mul_mat(ctx, w.w2, act)), w.final_norm, c.norm_eps);
-        if (logits && w.head) *logits = ggml_mul_mat(ctx, w.head, out);
+        auto * act = w.w13 ? ggml_swiglu(ctx, mm(ctx, w.w13, ff))
+                           : ggml_swiglu_split(ctx, mm(ctx, w.w1, ff), mm(ctx, w.w3, ff));
+        auto * out = norm(ctx, ggml_add(ctx, residual, mm(ctx, w.w2, act)), w.final_norm, c.norm_eps);
+        if (logits && w.head) *logits = mm(ctx, w.head, out);
         return out;
     }
 
@@ -1267,6 +1298,7 @@ void Drama3BatchEngine::run(const std::vector<Drama3BatchJob> & jobs, const std:
     impl_->run(jobs, done);
 }
 const Drama3BatchStats & Drama3BatchEngine::stats() const { return impl_->stats_; }
+void Drama3BatchEngine::requeue(const Drama3BatchJob & job) { impl_->queue_.push_back(job); }
 void Drama3BatchEngine::reset_stats() { impl_->stats_ = {}; }
 
 }  // namespace engine::models::fish_drama3
