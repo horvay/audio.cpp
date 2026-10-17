@@ -25,25 +25,22 @@ static  void conv_transpose_1d_kernel(
     }
 
     int out_index = global_index / dst_ne0;
+    const int idx = global_index % dst_ne0;
+
+    // Only inputs i with i*s0 <= idx < i*s0 + K touch this output: i in [ceil((idx - K + 1) / s0), idx / s0].
+    // (The upstream kernel scanned all src1_ne0 inputs per output and skipped the rest: O(length) per output,
+    // which made long codec decodes take minutes.)
+    const int i_lo = idx >= src0_ne0 ? (idx - src0_ne0) / s0 + 1 : 0;
+    const int i_hi = sycl::min(idx / s0, src1_ne0 - 1);
 
     float accumulator = 0;
 
     for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
+        const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+        const int input_offset = src1_ne0 * c;
 
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
-
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = src0[kernel_offset + weight_idx];
-            float input_value =  src1[input_offset+i];
-
-            accumulator += kernel_weight * input_value;
+        for (int i = i_lo; i <= i_hi; i++) {
+            accumulator += src0[kernel_offset + idx - i*s0] * src1[input_offset + i];
         }
     }
     dst[global_index] = accumulator;
@@ -92,6 +89,33 @@ void ggml_sycl_op_conv_transpose_1d(ggml_backend_sycl_context & ctx, ggml_tensor
     const int s0 = opts[0];
 
     const int64_t output_size = ggml_nelements(dst);
+
+    // As a GEMM plus overlap-add: col[i][co*K + t] = sum_ci x[ci][i] * w[ci][co][t] (oneMKL, one call for every tap and
+    // input position), then out[co][j] = sum over i*s0 + t == j of col[i][co*K + t]. The direct kernel below re-reads
+    // the weights for every output sample; the decoders of audio codecs (Fish DAC) spent seconds per take in it.
+    // GGML_SYCL_CONVT_NAIVE=1 forces the direct kernel.
+    static const bool naive = getenv("GGML_SYCL_CONVT_NAIVE") != nullptr;
+    const int64_t K = src0->ne[0], Cout = src0->ne[1], Cin = src0->ne[2], L = src1->ne[0], OL = dst->ne[0];
+    if (!naive && src1->ne[1] == Cin && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[1] == Cout && dst->ne[2] == 1 &&
+        K * Cout * L <= (int64_t) 1 << 31) {
+        ggml_sycl_pool_alloc<float> col(ctx.pool(), (size_t) K * Cout * L);
+        float * colp = col.get();
+        // column-major: col (L x K*Cout, ld L) = x^T (L x Cin, ld L) * w^T, w viewed as (K*Cout x Cin, ld K*Cout)
+        const float alpha = 1.f, beta = 0.f;
+        SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
+            *stream, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::trans, L, K * Cout, Cin, alpha, src1_d, L,
+            src0_d, K * Cout, beta, colp, L)));
+        stream->parallel_for(sycl::range<2>(Cout, OL), [=](sycl::id<2> id) {
+            const int64_t co = id[0], j = id[1];
+            float acc = 0.f;
+            for (int64_t t = j % s0; t < K; t += s0) {
+                const int64_t i = (j - t) / s0;
+                if (i >= 0 && i < L) acc += colp[(co * K + t) * L + i];
+            }
+            dst_d[co * OL + j] = acc;
+        });
+        return;
+    }
 
     conv_transpose_1d_f32_f32_sycl(s0, output_size,
         src0->ne[0], src0->ne[1], src0->ne[2],

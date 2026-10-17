@@ -81,6 +81,30 @@ public:
         matmul_prim.execute(stream, matmul_args);
     }
 
+    // c[n][m] (f32) = a[m][k] (f16) x b[n][k] (f16) * b_scale, with b_scale a single f32 read from device memory when the
+    // primitive runs (no host sync). f16 inputs, f32 accumulation and output, on the matrix engines.
+    static void row_gemm_f16_scaled(ggml_backend_sycl_context & ctx, int m, int n, int k, const sycl::half * a,
+                                    const sycl::half * b, const float * b_scale, float * c, const queue_ptr & q) {
+        auto stream = ctx.stream_dnnl(q);
+        auto eng    = ctx.engine_dnnl(q);
+        const auto a_md = dnnl::memory::desc({1, m, k}, dt::f16, {(dnnl_dim_t) k * m, k, 1});
+        const auto b_md = dnnl::memory::desc({1, k, n}, dt::f16, {(dnnl_dim_t) n * k, 1, k});
+        const auto c_md = dnnl::memory::desc({1, m, n}, dt::f32, {(dnnl_dim_t) m * n, 1, m});
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        attr.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
+        auto pd = dnnl::matmul::primitive_desc(eng, a_md, b_md, c_md, attr);
+        auto scratchpad_mem = ctx.get_scratchpad_mem(pd.scratchpad_desc(), eng, q);
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({DNNL_ARG_SRC, dnnl::memory(a_md, eng, const_cast<sycl::half *>(a))});
+        args.insert({DNNL_ARG_WEIGHTS, dnnl::memory(b_md, eng, const_cast<sycl::half *>(b))});
+        args.insert({DNNL_ARG_DST, dnnl::memory(pd.dst_desc(), eng, c)});
+        args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
+        args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+                     dnnl::memory(dnnl::memory::desc({1}, dt::f32, {1}), eng, const_cast<float *>(b_scale))});
+        dnnl::matmul(pd).execute(stream, args);
+    }
+
     static void row_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
         const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q) {
 

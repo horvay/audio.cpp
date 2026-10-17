@@ -34,6 +34,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,15 @@ using namespace engine::models::fish_drama3;
 using Clock = std::chrono::steady_clock;
 
 namespace {
+
+// D3_BACKEND=sycl runs the model and the GPU codec on ggml's SYCL backend (Intel's stack over Level Zero) instead of
+// Vulkan (the default).
+engine::core::BackendType gpu_backend_type() {
+    const char * v = getenv("D3_BACKEND");
+    if (v == nullptr || *v == 0 || std::string(v) == "vulkan") return engine::core::BackendType::Vulkan;
+    if (std::string(v) == "sycl") return engine::core::BackendType::Sycl;
+    throw std::runtime_error(std::string("D3_BACKEND: unknown backend ") + v + " (vulkan|sycl)");
+}
 
 struct Line {
     std::string name, voice, text, ref_text;
@@ -206,7 +216,7 @@ int main(int argc, char ** argv) {
         // CPU codec throughput test: decode the first cached reference code file with N workers in parallel.
         auto assets = load_drama3_assets(model);
         engine::core::BackendConfig cpu;
-        cpu.type = codec_mode == "gpu" ? engine::core::BackendType::Vulkan : engine::core::BackendType::Cpu;
+        cpu.type = codec_mode == "gpu" ? gpu_backend_type() : engine::core::BackendType::Cpu;
         cpu.threads = opt.codec_cpu_threads;
         engine::core::ExecutionContext exec(cpu);
         engine::codecs::FishDacCodecRuntimeOptions copt;
@@ -295,7 +305,7 @@ int main(int argc, char ** argv) {
     const auto t_load = Clock::now();
     auto assets = load_drama3_assets(model);
     engine::core::BackendConfig backend;
-    backend.type = engine::core::BackendType::Vulkan;
+    backend.type = gpu_backend_type();
     backend.threads = 8;
     engine::core::ExecutionContext execution(backend);
     Drama3BatchEngine engine(assets, execution, opt);
@@ -385,7 +395,7 @@ int main(int argc, char ** argv) {
         }
     };
     std::vector<std::thread> workers;
-    // GPU codec: one worker thread with the codec's own Vulkan backend, overlapping generation. CPU codec: N workers.
+    // GPU codec: one worker thread with the codec's own GPU backend, overlapping generation. CPU codec: N workers.
     const bool threaded_gpu = codec_mode == "gpu" && getenv("D3_ASYNC_DECODE") != nullptr;
     if (codec_mode == "cpu" || threaded_gpu) {
         const int nworkers = codec_mode == "cpu" ? decode_workers : 1;

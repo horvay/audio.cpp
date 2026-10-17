@@ -16,6 +16,7 @@ enum class BackendType {
     Hip,
     Vulkan,
     Metal,
+    Sycl,  // ggml's SYCL backend (Intel GPUs over Level Zero)
     BestAvailable,
 };
 

@@ -38,6 +38,7 @@ constexpr BackendRegNames k_backend_reg_names[] = {
     {BackendType::Hip,    {"ROCm", nullptr, nullptr}},
     {BackendType::Vulkan, {"Vulkan", nullptr, nullptr}},
     {BackendType::Metal,  {"MTL", nullptr, nullptr}},
+    {BackendType::Sycl,   {"SYCL", nullptr, nullptr}},
 };
 
 bool reg_name_matches(BackendType type, const char * reg_name) {
@@ -80,6 +81,10 @@ bool is_vulkan_backend_handle(ggml_backend_t backend) {
 
 bool is_metal_backend_handle(ggml_backend_t backend) {
     return backend_handle_matches(backend, BackendType::Metal);
+}
+
+bool is_sycl_backend_handle(ggml_backend_t backend) {
+    return backend_handle_matches(backend, BackendType::Sycl);
 }
 
 ggml_backend_reg_t find_reg_by_backend_type(BackendType type) {
@@ -221,7 +226,7 @@ void print_backend_devices(std::ostream & out) {
         }
         out << " [" << device.type << "]\n";
     }
-    out << "select with: --backend <cuda|hip|vulkan|metal|cpu> --device <index>\n";
+    out << "select with: --backend <cuda|hip|vulkan|metal|sycl|cpu> --device <index>\n";
 }
 
 ggml_backend_t init_backend(const BackendConfig & config) {
@@ -242,6 +247,8 @@ ggml_backend_t init_backend(const BackendConfig & config) {
             return init_device_backend(BackendType::Vulkan, "Vulkan", config);
         case BackendType::Metal:
             return init_device_backend(BackendType::Metal, "Metal", config);
+        case BackendType::Sycl:
+            return init_device_backend(BackendType::Sycl, "SYCL", config);
         case BackendType::BestAvailable: {
             ggml_backend_t backend = ggml_backend_init_best();
             if (backend == nullptr) {
@@ -332,6 +339,9 @@ BackendType backend_type(ggml_backend_t backend) {
     }
     if (is_metal_backend_handle(backend)) {
         return BackendType::Metal;
+    }
+    if (is_sycl_backend_handle(backend)) {
+        return BackendType::Sycl;
     }
     return BackendType::BestAvailable;
 }

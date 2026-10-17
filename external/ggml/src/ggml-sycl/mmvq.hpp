@@ -38,6 +38,10 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    int                n_tokens          = 1, // tokens in one launch (grid dim 0)
+    size_t             ids_token_stride  = 0, // int32 elements between tokens in ids_dev
+    size_t             src1_token_stride = 0, // bytes between tokens in vy
+    size_t             dst_token_stride  = 0); // bytes between tokens in dst_base
 
 #endif // GGML_SYCL_MMVQ_HPP

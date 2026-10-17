@@ -129,11 +129,11 @@ static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *sr
     GGML_UNUSED(ctx);
 }
 
-template <typename src0_t>
+template <typename src0_t, typename dst_t = float>
 static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                 const ggml_tensor *src1, ggml_tensor *dst,
                                 const src0_t *src0_dd, const int32_t *src1_dd,
-                                float *dst_dd, queue_ptr stream) {
+                                dst_t *dst_dd, queue_ptr stream) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -170,7 +170,8 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // I32 rows (index tables) stay I32, as ggml_get_rows defines; everything else is gathered into F32
+    GGML_ASSERT(dst->type == (dst->src[0]->type == GGML_TYPE_I32 ? GGML_TYPE_I32 : GGML_TYPE_F32));
 
     GGML_ASSERT(dst->src[0]->nb[0] == ggml_type_size(dst->src[0]->type));
     GGML_ASSERT(dst->src[1]->nb[0] == ggml_type_size(dst->src[1]->type));
@@ -179,6 +180,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int32_t * src1_i32 = (const int32_t *) dst->src[1]->data;
     /* TODO: Refactor and remove duplicates */
     switch (dst->src[0]->type) {
+        case GGML_TYPE_I32:
+            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const int32_t *)dst->src[0]->data,
+                                src1_i32, (int32_t *)dst->data, ctx.stream());
+            break;
         case GGML_TYPE_F16:
             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const sycl::half *)dst->src[0]->data,
                                 src1_i32, (float *)dst->data, ctx.stream());
