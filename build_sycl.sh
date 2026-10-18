@@ -30,7 +30,7 @@ cmake -S "$HERE" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLEVEL_ZERO_DEV_INCLUDE_DIR="$ZE_INC" -DZE_LOADER_LIB=/usr/lib/libze_loader.so \
   -DCMAKE_EXE_LINKER_FLAGS="-static-intel -Wl,--disable-new-dtags -L$UMF -Wl,--no-as-needed -lumf -Wl,--as-needed -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen \"-device bmg-g31\"" \
   -DCMAKE_BUILD_RPATH="$CMPLR/lib;$UMF;$MKLROOT/lib;$ONEDNN/lib" -DCMAKE_INSTALL_RPATH="$CMPLR/lib;$UMF;$MKLROOT/lib;$ONEDNN/lib"
-nice -n 10 cmake --build "$BUILD" --target drama3_batch -j "${JOBS:-3}"
+nice -n 10 cmake --build "$BUILD" --target drama3_batch audiocpp_cli -j "${JOBS:-3}"
 ldd "$BUILD/bin/drama3_batch" | grep -Ei 'vulkan|torch|c10' && { echo "unexpected Vulkan/torch dependency" >&2; exit 1; } || true
 ldd "$BUILD/bin/drama3_batch" | grep "not found" && { echo "missing shared libraries" >&2; exit 1; } || true
 echo "built $BUILD/bin/drama3_batch"

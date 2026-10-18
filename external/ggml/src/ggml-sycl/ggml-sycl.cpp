@@ -1,3 +1,4 @@
+#include <mutex>
 #include <map>
 #include <set>
 //
@@ -494,6 +495,38 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Host -> device upload for set_tensor. Upstream copied every tensor into a malloc'd buffer (an mmap workaround for
+// PVC) and from there to the device, from pageable memory: about 1.5 GB/s for sd.cpp's staged 32B text encoder.
+// Now: sources in USM host/shared memory (pinned, e.g. SYCL_Host buffers) go to the device directly; other memory
+// streams through two reusable 32 MiB pinned buffers, overlapping the CPU copy with the DMA. Small pieces also keep
+// clear of the large userptr pins that hung the copy engine under memory pressure (compute-runtime#1010).
+static void ggml_sycl_upload(sycl::queue & q, void * dst, const void * src, size_t size) {
+    const auto kind = sycl::get_pointer_type(src, q.get_context());
+    if (kind == sycl::usm::alloc::host || kind == sycl::usm::alloc::shared || kind == sycl::usm::alloc::device) {
+        q.memcpy(dst, src, size).wait();
+        return;
+    }
+    constexpr size_t CHUNK = 32u << 20;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    // allocated once, for the context of the first queue (one device here); other contexts take a plain copy
+    static const sycl::context owner = q.get_context();
+    static char * const bufs[2] = {sycl::malloc_host<char>(CHUNK, q), sycl::malloc_host<char>(CHUNK, q)};
+    if (bufs[0] == nullptr || bufs[1] == nullptr || owner != q.get_context()) {
+        q.memcpy(dst, src, size).wait();
+        return;
+    }
+    sycl::event ev[2];
+    for (size_t off = 0, k = 0; off < size; off += CHUNK, k ^= 1) {
+        const size_t n = std::min(CHUNK, size - off);
+        ev[k].wait();  // the DMA that last used this buffer
+        memcpy(bufs[k], (const char *) src + off, n);
+        ev[k] = q.memcpy((char *) dst + off, bufs[k], n);
+    }
+    ev[0].wait();
+    ev[1].wait();
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -506,12 +539,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
-    char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
-    free(host_buf);
+    ggml_sycl_upload(*stream, (char *) tensor->data + offset, data, size);
 #else
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
 #endif
